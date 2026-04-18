@@ -73,13 +73,13 @@ Rich tickets with goals, constraints, references, screenshots, and QA watch poin
 ---
 
 ## Workflow Lifecycle
-
-
+```
 Backlog → Open → InProgress → QAReview → Done
                      │            ↓ (if issues found)
                      │         ReOpen → InProgress
                      │
                      └─(need_qa: false)→ Done   ← Auto-Done, skips QA
+```
 ---
 
 ## Built For
@@ -178,6 +178,20 @@ TCK is based on a structured approach to managing AI work.
 Read the full paper:
 [View Whitepaper](docs/WHITEPAPER.md)
 
+---
+## 📄 Framework Specification
+
+Read the full TCK system:
+
+[View Framework Specification](docs/FRAMEWORK_SPEC.md)
+
+## 📚 Examples
+
+See how TCK works in real scenarios:
+
+- [Content Creator Workflow](docs/examples/content-creator.md)
+- [Design Studio Workflow](docs/examples/design-studio.md)
+- [Legal Firm Workflow](docs/examples/legal-firm.md)
 ---
 ## Current Status
 
