@@ -1,0 +1,22 @@
+views:
+  - type: table
+    name: Table
+    filters:
+      and:
+        - file.tags.contains("tck")
+    order:
+      - file.name
+      - status
+      - file.tags
+      - created
+      - need_qa
+      - builder_tokens
+      - file.folder
+  - type: cards
+    name: View
+    filters:
+      and:
+        - file.tags.contains("tck")
+  - type: list
+    name: Kanban
+    image: note.status
