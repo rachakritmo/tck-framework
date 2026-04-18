@@ -171,7 +171,14 @@ AI should not operate in chaos.
 TCK provides the control layer that helps AI work safely, transparently, and productively.
 
 ---
+## 📄 Whitepaper
 
+TCK is based on a structured approach to managing AI work.
+
+Read the full paper:
+[View Whitepaper](docs/WHITEPAPER.md)
+
+---
 ## Current Status
 
 🚧 Active prototype / early community release
