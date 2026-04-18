@@ -1,4 +1,4 @@
-# TCK — Ticket Control Kit
+# TCK — Control Layer for AI Work
 
 Control layer for AI work.
 
