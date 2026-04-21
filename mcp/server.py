@@ -8,7 +8,9 @@ Teams are auto-discovered: any vault subfolder containing a Tickets/ directory i
 """
 
 import json
+import os
 import re
+import subprocess
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -17,6 +19,8 @@ from mcp.server.fastmcp import FastMCP
 
 VAULT_ROOT        = Path(__file__).parent.parent  # /Users/tong/chain
 TICKET_LOGS_DIR   = VAULT_ROOT / "Ticket Logs"
+PIDS_DIR          = VAULT_ROOT / ".pids"
+CLAUDE_BIN        = Path.home() / ".local" / "bin" / "claude"
 
 VALID_STATUSES = ["Backlog", "Open", "InProgress", "QAReview", "Done", "ReOpen", "Escalated"]
 REOPEN_LIMIT = 4
@@ -266,10 +270,11 @@ def parse_ticket(team: str, path: Path) -> dict:
         "reopen_count":   int(fm.get("reopen_count", 0)),
         "builder_tokens": int(fm.get("builder_tokens", 0)),
         "qa_tokens":      int(fm.get("qa_tokens", 0)),
-        "need_qa":        fm.get("need_qa", "true").lower() == "true",
-        "created":        fm.get("created", ""),
-        "updated":        fm.get("updated", ""),
-        "file_name":      path.name,
+        "need_qa":          fm.get("need_qa", "true").lower() == "true",
+        "work_with_human":  fm.get("work_with_human", "false").lower() == "true",
+        "created":          fm.get("created", ""),
+        "updated":          fm.get("updated", ""),
+        "file_name":        path.name,
     }
 
 
@@ -415,6 +420,7 @@ def create_ticket(
     ticket_id: str = "",
     watch_points: str = "",
     need_qa: bool = True,
+    work_with_human: bool = False,
 ) -> str:
     """
     Create a new ticket in the team's Tickets folder with status Backlog.
@@ -422,16 +428,21 @@ def create_ticket(
     ticket_id is optional — auto-generated (e.g. TCK-APP-2604-001) if not provided.
     watch_points is optional — leave blank if no special QA focus.
     need_qa defaults to true — set to false to skip QA and auto-complete on submit_work.
+    work_with_human defaults to false — set to true so the agent pauses and works interactively
+    with the human instead of executing autonomously.
 
     Args:
-        team:         team name (e.g. "ux", "app", "deploy") — auto-discovered from vault
-        title:        Short descriptive title
-        goal:         Markdown — what needs to be achieved and why
-        dos:          Markdown — requirements and allowed behaviors
-        donts:        Markdown — constraints and prohibited behaviors
-        ticket_id:    Optional. Auto-generated if not provided.
-        watch_points: Optional Markdown — what QA should pay special attention to.
-        need_qa:      Optional. Default true. Set false to skip QA — ticket auto-completes on submit_work.
+        team:             team name (e.g. "ux", "app", "deploy") — auto-discovered from vault
+        title:            Short descriptive title
+        goal:             Markdown — what needs to be achieved and why
+        dos:              Markdown — requirements and allowed behaviors
+        donts:            Markdown — constraints and prohibited behaviors
+        ticket_id:        Optional. Auto-generated if not provided.
+        watch_points:     Optional Markdown — what QA should pay special attention to.
+        need_qa:          Optional. Default true. Set false to skip QA — ticket auto-completes on submit_work.
+        work_with_human:  Optional. Default false. Set true — agent pauses and collaborates with
+                          the human rather than working autonomously. Human drives the session;
+                          when they say "ok" the agent calls submit_work.
 
     Returns: Ticket object | Error
     """
@@ -457,6 +468,7 @@ reopen_count: 0
 builder_tokens: 0
 qa_tokens: 0
 need_qa: {"true" if need_qa else "false"}
+work_with_human: {"true" if work_with_human else "false"}
 created: {ts}
 updated: {ts}
 tags: [tck, team/{team}]
@@ -720,8 +732,8 @@ def submit_work(ticket_id: str, by_agent: str, summary: str, note: str = "", tok
     if not ticket["need_qa"]:
         # Skip QA — auto-complete to Done
         content = update_frontmatter(content, {"status": "Done", "updated": now_ts(), "builder_tokens": new_builder_tokens})
-        content = append_log_block(content, "auto_done", by_agent,
-                                   "QA not required — ticket auto-completed on submit.", "Done")
+        auto_done_text = f"{summary}\n\n_QA not required — ticket auto-completed on submit._"
+        content = append_log_block(content, "auto_done", by_agent, auto_done_text, "Done")
         path.write_text(content)
         append_activity_log("Builder", team, ticket["ticket_id"], ticket["title"], by_agent, "Auto-Done", note or summary, tokens, duration)
     else:
@@ -895,6 +907,166 @@ def open_all_tickets(team: str, by: str = "pm-agent") -> str:
         append_activity_log("Builder", team, tid, tname, by, "Opened")
 
     return json.dumps({"opened": opened, "count": len(opened)}, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Agent Management Tools
+# ---------------------------------------------------------------------------
+
+def _agent_cpu(pid: int) -> float:
+    """Sample CPU usage of a process twice and return the higher value."""
+    import time
+    def sample(pid):
+        r = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "%cpu="],
+            capture_output=True, text=True
+        )
+        return float(r.stdout.strip() or "0")
+    cpu1 = sample(pid)
+    time.sleep(0.5)
+    cpu2 = sample(pid)
+    return max(cpu1, cpu2)
+
+
+@mcp.tool()
+def get_agent_status(team: str) -> str:
+    """
+    Get the current status of a team agent — whether it is running, idle, or busy.
+
+    Uses CPU usage as the signal:
+      - ~0% CPU → idle (waiting at the prompt)
+      - >5% CPU  → busy (actively processing a ticket)
+
+    Args:
+        team: team name (e.g. "ux", "app")
+
+    Returns: { team, pid, process_status, cpu, agent_status } | Error
+      agent_status: "idle" | "busy" | "dead" | "not_running"
+    """
+    if e := validate_team(team):
+        return err(e)
+
+    pid_file = PIDS_DIR / f"{team}-agent.pid"
+
+    if not pid_file.exists():
+        return json.dumps({"team": team, "agent_status": "not_running"})
+
+    pid = int(pid_file.read_text().strip())
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return json.dumps({"team": team, "pid": pid, "agent_status": "dead"})
+
+    cpu = _agent_cpu(pid)
+    agent_status = "busy" if cpu > 5.0 else "idle"
+
+    return json.dumps({"team": team, "pid": pid, "cpu": round(cpu, 1), "agent_status": agent_status})
+
+
+DRAIN_PROMPT = "Clear all tickets."
+
+@mcp.tool()
+def start_agent(team: str, drain: bool = True) -> str:
+    """
+    Start a Claude agent for a team by opening a Terminal window at the team workspace.
+    Saves the agent PID to .pids/<team>-agent.pid.
+
+    Args:
+        team:  team name (e.g. "ux", "app")
+        drain: True (default) — agent starts with a prompt to drain the ticket queue automatically.
+               False — agent starts in interactive mode, waiting for human input.
+
+    Returns: { team, status, mode } | Error
+    """
+    if e := validate_team(team):
+        return err(e)
+
+    workspace = VAULT_ROOT / team
+    pid_file  = PIDS_DIR / f"{team}-agent.pid"
+    PIDS_DIR.mkdir(exist_ok=True)
+
+    # Check if already running
+    if pid_file.exists():
+        pid = int(pid_file.read_text().strip())
+        try:
+            os.kill(pid, 0)
+            return json.dumps({"team": team, "pid": pid, "status": "already_running"})
+        except ProcessLookupError:
+            pid_file.unlink()
+
+    launch_file = PIDS_DIR / f"{team}-launch.sh"
+    claude_cmd  = f"exec {CLAUDE_BIN} '{DRAIN_PROMPT}'" if drain else f"exec {CLAUDE_BIN}"
+    launch_file.write_text(
+        f"#!/bin/bash\n"
+        f"echo $$ > {pid_file}\n"
+        f"{claude_cmd}\n"
+    )
+    launch_file.chmod(0o755)
+
+    script = (
+        f'tell application "Terminal" to do script '
+        f'"cd {workspace} && {launch_file}"\n'
+        f'tell application "Terminal" to activate'
+    )
+    subprocess.run(["osascript", "-e", script], check=True)
+
+    mode = "drain" if drain else "interactive"
+    return json.dumps({"team": team, "status": "starting", "mode": mode, "pid_file": str(pid_file)})
+
+
+
+
+@mcp.tool()
+def stop_agent(team: str) -> str:
+    """
+    Stop a running team agent by terminating its process.
+
+    Args:
+        team: team name (e.g. "ux", "app")
+
+    Returns: { team, pid, status } | Error
+    """
+    if e := validate_team(team):
+        return err(e)
+
+    pid_file = PIDS_DIR / f"{team}-agent.pid"
+
+    if not pid_file.exists():
+        return err(f"no running agent found for team '{team}'")
+
+    pid = int(pid_file.read_text().strip())
+
+    try:
+        os.kill(pid, 15)  # SIGTERM — graceful shutdown
+        pid_file.unlink()
+        return json.dumps({"team": team, "pid": pid, "status": "stopped"})
+    except ProcessLookupError:
+        pid_file.unlink()
+        return json.dumps({"team": team, "pid": pid, "status": "was_not_running"})
+
+
+@mcp.tool()
+def list_agents() -> str:
+    """
+    List all known team agents and their running status.
+
+    Returns: [{ team, pid, status }]
+    """
+    PIDS_DIR.mkdir(exist_ok=True)
+    results = []
+
+    for pid_file in sorted(PIDS_DIR.glob("*-agent.pid")):
+        team = pid_file.stem.replace("-agent", "")
+        pid  = int(pid_file.read_text().strip())
+        try:
+            os.kill(pid, 0)
+            status = "running"
+        except ProcessLookupError:
+            status = "dead"
+
+        results.append({"team": team, "pid": pid, "status": status})
+
+    return json.dumps(results, indent=2)
 
 
 if __name__ == "__main__":
