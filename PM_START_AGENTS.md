@@ -1,6 +1,8 @@
 # PM Agent Management Guide
 
-The PM can start, stop, and inspect team agents directly from MCP tools.
+The PM can start, stop, and inspect team agents directly from MCP tools. The human chooses the runtime explicitly: **Codex** or **Claude**.
+
+No `.tck.local.json` is used. There is no stored default runtime.
 
 ---
 
@@ -8,38 +10,51 @@ The PM can start, stop, and inspect team agents directly from MCP tools.
 
 | Tool | Purpose |
 |---|---|
-| `start_agent(team)` | Open a Terminal window and launch the agent — it drains the ticket queue automatically |
-| `get_agent_status(team)` | Check if the agent is idle, busy, dead, or not running |
-| `stop_agent(team)` | Gracefully shut down a running agent |
-| `list_agents()` | Check which agents are running and their process status |
+| `start_agent(team, runtime, drain=True)` | Open a Terminal window and launch the selected runtime |
+| `get_agent_status(team, runtime)` | Check if that team/runtime agent is idle, busy, dead, or not running |
+| `stop_agent(team, runtime)` | Gracefully shut down that team/runtime agent |
+| `list_agents()` | Check all tracked team/runtime processes |
+
+If the human says "start app" or "check ux" without naming a runtime, ask:
+
+```text
+Which runtime should I use: Codex or Claude?
+```
 
 ---
 
 ## start_agent
 
 ```python
-start_agent(team, drain=True)
+start_agent(team, runtime, drain=True)
 ```
 
-Opens a new Terminal window at `<team>/` and starts the Claude agent.
+Opens a new Terminal window at `<team>/` and starts the selected runtime.
+
+| `runtime` | Behaviour |
+|---|---|
+| `"codex"` | Runs `codex --dangerously-bypass-approvals-and-sandbox` in the team workspace |
+| `"claude"` | Runs `~/.local/bin/claude` in the team workspace |
 
 | `drain` | Behaviour |
 |---|---|
-| `True` *(default)* | Agent starts with the drain prompt — works Builder + QA for every ticket autonomously |
-| `False` | Agent starts in interactive mode — waits at `>` for human input |
+| `True` *(default)* | Agent gives its short startup greeting, then works Builder + QA for every ticket autonomously |
+| `False` | Agent gives its short startup greeting, checks `Messages/inbox.md`, then waits for human input |
 
-- If the agent is **already running**, returns `"status": "already_running"` — no duplicate is launched.
+- If the selected team/runtime is already running, returns `"status": "already_running"` — no duplicate is launched.
 - If the PID file exists but the process is dead, it cleans up and starts fresh.
+- PID files are runtime-aware: `.pids/<team>-<runtime>-agent.pid`.
 
 ```python
-start_agent("ux")
-# → { "team": "ux", "status": "starting", "mode": "drain", "pid_file": ".pids/ux-agent.pid" }
+start_agent("ux", "codex")
+# → { "team": "ux", "runtime": "codex", "status": "starting", "mode": "drain", "pid_file": ".pids/ux-codex-agent.pid" }
 
-start_agent("ux", drain=False)
-# → { "team": "ux", "status": "starting", "mode": "interactive", "pid_file": ".pids/ux-agent.pid" }
+start_agent("ux", "claude", drain=False)
+# → { "team": "ux", "runtime": "claude", "status": "starting", "mode": "interactive", "pid_file": ".pids/ux-claude-agent.pid" }
 
-start_agent("ux")   # called again while already running
-# → { "team": "ux", "pid": 12345, "status": "already_running" }
+start_agent("ux", "codex")
+# called again while already running
+# → { "team": "ux", "runtime": "codex", "pid": 12345, "status": "already_running" }
 ```
 
 ---
@@ -47,41 +62,40 @@ start_agent("ux")   # called again while already running
 ## get_agent_status
 
 ```python
-get_agent_status(team)
+get_agent_status(team, runtime)
 ```
 
 Returns real-time status using CPU usage as the signal.
 
 ```python
-get_agent_status("ux")
-# → { "team": "ux", "pid": 9801, "cpu": 0.0, "agent_status": "idle" }
+get_agent_status("ux", "codex")
+# → { "team": "ux", "runtime": "codex", "pid": 9801, "cpu": 0.0, "agent_status": "idle" }
 
-get_agent_status("app")
-# → { "team": "app", "pid": 9900, "cpu": 72.4, "agent_status": "busy" }
+get_agent_status("app", "claude")
+# → { "team": "app", "runtime": "claude", "pid": 9900, "cpu": 72.4, "agent_status": "busy" }
 ```
 
 | `agent_status` | Meaning |
 |---|---|
-| `idle` | Process alive, CPU ≈ 0% — finished all tickets, waiting at `>` prompt |
-| `busy` | Process alive, CPU > 5% — actively working a ticket |
+| `idle` | Process alive, CPU near 0% — finished all tickets, waiting at the prompt |
+| `busy` | Process alive, CPU above 5% — actively working a ticket |
 | `dead` | PID file exists but process is gone — crashed or killed externally |
 | `not_running` | No PID file — never started or cleanly stopped |
+| `running_unknown` | Process exists but this environment cannot sample CPU for it |
 
 ---
 
 ## stop_agent
 
 ```python
-stop_agent(team)
+stop_agent(team, runtime)
 ```
 
-Sends `SIGTERM` (graceful shutdown) to the agent process and removes the PID file.
-
-- If the process is already dead, it cleans up the PID file and returns `"status": "was_not_running"`.
+Sends `SIGTERM` to the selected team/runtime process and removes its PID file.
 
 ```python
-stop_agent("ux")
-# → { "team": "ux", "pid": 12345, "status": "stopped" }
+stop_agent("ux", "codex")
+# → { "team": "ux", "runtime": "codex", "pid": 12345, "status": "stopped" }
 ```
 
 ---
@@ -97,12 +111,12 @@ Reads all PID files under `.pids/` and checks whether each process is alive.
 ```python
 list_agents()
 # → [
-#     { "team": "app", "pid": 12346, "status": "running" },
-#     { "team": "ux",  "pid": 12345, "status": "dead"    }
+#     { "team": "app", "runtime": "codex",  "pid": 12346, "status": "running" },
+#     { "team": "ux",  "runtime": "claude", "pid": 12345, "status": "dead"    }
 #   ]
 ```
 
-`"dead"` means the PID file exists but the process is gone — run `start_agent` again to restart.
+`"dead"` means the PID file exists but the process is gone — run `start_agent(team, runtime)` again to restart.
 
 ---
 
@@ -112,44 +126,41 @@ list_agents()
 # Open tickets
 open_all_tickets("ux")
 
-# Start agent — it drains the queue automatically
-start_agent("ux")
+# Start the selected runtime — it drains the queue automatically
+start_agent("ux", "codex")
 
-# Check progress — agent does Builder first, then QA
-get_agent_status("ux")   # busy while working, idle when done
-list_agents()            # overview of all teams
+# Check progress
+get_agent_status("ux", "codex")
+list_agents()
 
 # Shut down when done
-stop_agent("ux")
+stop_agent("ux", "codex")
 ```
 
 ---
 
-## When the Agent Goes Idle
+## When The Agent Goes Idle
 
-The drain runs **once on start**. When the queue is empty the agent stops working and waits at the `>` prompt — it will not pick up new tickets automatically.
+The drain runs once on start. When the queue is empty the agent waits at the prompt and will not pick up new tickets automatically.
 
-**If new tickets arrive after the agent is idle:**
-- The PM cannot push work to an idle agent
-- Tell the human: *"The agent has finished its queue and is now idle. To process new tickets, type a message in the agent's Terminal window."*
-- The human types directly in the Terminal to give the agent its next instruction
+If new tickets arrive after the agent is idle, tell the human:
 
-**Suggested message to give the human:**
-```
-The ux agent is idle — all tickets are done.
+```text
+The ux Codex agent is idle — all tickets are done.
 If you open more tickets and want the agent to pick them up,
-type this in the ux Terminal window:
+type this in the ux Codex Terminal window:
 
   Drain the ticket queue: Builder then QA, one ticket at a time.
-```
 
-To avoid this, `stop_agent` after the queue is empty. Next time tickets are ready, `start_agent` launches fresh with the drain prompt.
+Or call stop_agent("ux", "codex") and then start_agent("ux", "codex") to restart cleanly.
+```
 
 ---
 
 ## Notes
 
 - `start_agent` requires macOS — it uses `osascript` to open Terminal.
-- The agent binary is expected at `~/.local/bin/claude`.
-- PID files are stored in `<project>/.pids/` — auto-created if the folder doesn't exist.
-- `stop_agent` sends `SIGTERM` — the agent finishes its current operation before exiting.
+- Codex is resolved from `PATH` as `codex`.
+- Claude is expected at `~/.local/bin/claude`.
+- PID files are stored in `<project>/.pids/`.
+- `stop_agent` sends `SIGTERM` — the agent finishes its current operation before exiting when the runtime handles termination gracefully.

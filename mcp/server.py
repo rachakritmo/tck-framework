@@ -10,6 +10,7 @@ Teams are auto-discovered: any vault subfolder containing a Tickets/ directory i
 import json
 import os
 import re
+import shlex
 import subprocess
 import threading
 from datetime import datetime
@@ -21,8 +22,10 @@ VAULT_ROOT        = Path(__file__).parent.parent  # /Users/tong/chain
 TICKET_LOGS_DIR   = VAULT_ROOT / "Ticket Logs"
 PIDS_DIR          = VAULT_ROOT / ".pids"
 CLAUDE_BIN        = Path.home() / ".local" / "bin" / "claude"
+CODEX_BIN         = "codex"
 
 VALID_STATUSES = ["Backlog", "Open", "InProgress", "QAReview", "Done", "ReOpen", "Escalated"]
+VALID_RUNTIMES = ["claude", "codex"]
 REOPEN_LIMIT = 4
 
 mcp = FastMCP("ticket-mcp")
@@ -388,8 +391,22 @@ def append_activity_log(
     _insert_log_row(all_log, all_row, all_header, all_sep)
 
 
+def atomic_write(path: Path, content: str) -> None:
+    """Write content atomically — temp file + replace, so a crash never corrupts the target."""
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(content)
+    tmp.replace(path)
+
+
 def err(msg: str) -> str:
     return json.dumps({"error": msg})
+
+
+def validate_runtime(runtime: str) -> str | None:
+    """Return error string if runtime is invalid, else None."""
+    if runtime not in VALID_RUNTIMES:
+        return f"runtime required: one of {VALID_RUNTIMES}"
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -655,7 +672,7 @@ def open_ticket(ticket_id: str, by: str) -> str:
     content = path.read_text()
     content = update_frontmatter(content, {"status": "Open", "updated": now_ts()})
     content = append_log_block(content, "open", by, "Ticket moved to Open and ready for execution.", "Open")
-    path.write_text(content)
+    atomic_write(path, content)
 
     append_activity_log("Builder", team, ticket["ticket_id"], ticket["title"], by, "Opened")
 
@@ -688,7 +705,7 @@ def execute_ticket(ticket_id: str, by_agent: str) -> str:
     content = path.read_text()
     content = update_frontmatter(content, {"status": "InProgress", "updated": now_ts()})
     content = append_log_block(content, "claim", by_agent, "Ticket claimed and execution started.", "InProgress")
-    path.write_text(content)
+    atomic_write(path, content)
 
     if prev_status == "ReOpen":
         action = f"Claimed (ReOpen r{reopen_count})"
@@ -734,13 +751,13 @@ def submit_work(ticket_id: str, by_agent: str, summary: str, note: str = "", tok
         content = update_frontmatter(content, {"status": "Done", "updated": now_ts(), "builder_tokens": new_builder_tokens})
         auto_done_text = f"{summary}\n\n_QA not required — ticket auto-completed on submit._"
         content = append_log_block(content, "auto_done", by_agent, auto_done_text, "Done")
-        path.write_text(content)
+        atomic_write(path, content)
         append_activity_log("Builder", team, ticket["ticket_id"], ticket["title"], by_agent, "Auto-Done", note or summary, tokens, duration)
     else:
         # Normal flow — send to QA
         content = update_frontmatter(content, {"status": "QAReview", "updated": now_ts(), "builder_tokens": new_builder_tokens})
         content = append_log_block(content, "builder", by_agent, summary, "QAReview")
-        path.write_text(content)
+        atomic_write(path, content)
         append_activity_log("Builder", team, ticket["ticket_id"], ticket["title"], by_agent, "Submitted", note or summary, tokens, duration)
 
     return json.dumps(parse_ticket(team, path), indent=2)
@@ -770,7 +787,7 @@ def start_review(ticket_id: str, by_agent: str) -> str:
     content = path.read_text()
     content = update_frontmatter(content, {"updated": now_ts()})
     content = append_log_block(content, "qa", by_agent, "QA review started.")
-    path.write_text(content)
+    atomic_write(path, content)
 
     append_activity_log("QA", team, ticket["ticket_id"], ticket["title"], by_agent, "QA Started")
 
@@ -807,7 +824,7 @@ def review_pass(ticket_id: str, by_agent: str, notes: str, note: str = "", token
     content  = update_frontmatter(content, {"status": "Done", "updated": now_ts(), "qa_tokens": new_qa_tokens})
     clean_notes = re.sub(r"^(PASS|FAIL)\s*[—\-]\s*", "", notes, flags=re.IGNORECASE).strip()
     content  = append_log_block(content, "qa", by_agent, f"PASS — {clean_notes}", "Done")
-    path.write_text(content)
+    atomic_write(path, content)
 
     append_activity_log("QA", team, ticket["ticket_id"], ticket["title"], by_agent, "QA Pass", note or notes, tokens, duration)
 
@@ -853,14 +870,14 @@ def review_reopen(ticket_id: str, by_agent: str, issues: str, note: str = "", to
             f"ESCALATED — Reopen limit ({REOPEN_LIMIT}) exceeded. Requires human intervention. Last issue: {issues}",
             "Escalated",
         )
-        path.write_text(content)
+        atomic_write(path, content)
         append_activity_log("QA", team, ticket["ticket_id"], ticket["title"], by_agent, "Escalated", note or issues, tokens, duration)
         return json.dumps(parse_ticket(team, path), indent=2)
 
     content = update_frontmatter(content, {"status": "ReOpen", "updated": now_ts(), "reopen_count": new_count, "qa_tokens": new_qa_tokens})
     clean_issues = re.sub(r"^(PASS|FAIL)\s*[—\-]\s*", "", issues, flags=re.IGNORECASE).strip()
     content = append_log_block(content, "qa", by_agent, f"FAIL — {clean_issues}", "ReOpen")
-    path.write_text(content)
+    atomic_write(path, content)
 
     append_activity_log("QA", team, ticket["ticket_id"], ticket["title"], by_agent, f"QA Fail (r{new_count})", note or issues, tokens, duration)
 
@@ -898,7 +915,7 @@ def open_all_tickets(team: str, by: str = "pm-agent") -> str:
 
         content = update_frontmatter(content, {"status": "Open", "updated": now_ts()})
         content = append_log_block(content, "open", by, "Ticket opened and ready for execution.", "Open")
-        f.write_text(content)
+        atomic_write(f, content)
 
         title_m = re.search(r"#\s*🎫\s*Ticket:\s*\[([^\]]+)\]\s*(.+)", content)
         tid   = title_m.group(1).strip() if title_m else f.stem
@@ -928,61 +945,66 @@ def _agent_cpu(pid: int) -> float:
     return max(cpu1, cpu2)
 
 
-@mcp.tool()
-def get_agent_status(team: str) -> str:
-    """
-    Get the current status of a team agent — whether it is running, idle, or busy.
+def _runtime_pid_file(team: str, runtime: str) -> Path:
+    """Return the PID file path for one team/runtime pair."""
+    return PIDS_DIR / f"{team}-{runtime}-agent.pid"
 
-    Uses CPU usage as the signal:
-      - ~0% CPU → idle (waiting at the prompt)
-      - >5% CPU  → busy (actively processing a ticket)
 
-    Args:
-        team: team name (e.g. "ux", "app")
+def _runtime_launch_file(team: str, runtime: str) -> Path:
+    """Return the launch script path for one team/runtime pair."""
+    return PIDS_DIR / f"{team}-{runtime}-launch.sh"
 
-    Returns: { team, pid, process_status, cpu, agent_status } | Error
-      agent_status: "idle" | "busy" | "dead" | "not_running"
-    """
+
+def _applescript_string(value: str) -> str:
+    """Escape a shell command so it can be embedded in an AppleScript string."""
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _get_runtime_agent_status(team: str, runtime: str) -> str:
+    """Get status for one team/runtime agent process."""
     if e := validate_team(team):
         return err(e)
+    if e := validate_runtime(runtime):
+        return err(e)
 
-    pid_file = PIDS_DIR / f"{team}-agent.pid"
+    pid_file = _runtime_pid_file(team, runtime)
 
     if not pid_file.exists():
-        return json.dumps({"team": team, "agent_status": "not_running"})
+        return json.dumps({"team": team, "runtime": runtime, "agent_status": "not_running"})
 
     pid = int(pid_file.read_text().strip())
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
-        return json.dumps({"team": team, "pid": pid, "agent_status": "dead"})
+        return json.dumps({"team": team, "runtime": runtime, "pid": pid, "agent_status": "dead"})
+    except PermissionError:
+        return json.dumps({"team": team, "runtime": runtime, "pid": pid, "agent_status": "running_unknown"})
 
     cpu = _agent_cpu(pid)
     agent_status = "busy" if cpu > 5.0 else "idle"
 
-    return json.dumps({"team": team, "pid": pid, "cpu": round(cpu, 1), "agent_status": agent_status})
+    return json.dumps({"team": team, "runtime": runtime, "pid": pid, "cpu": round(cpu, 1), "agent_status": agent_status})
 
 
-DRAIN_PROMPT = "Clear all tickets."
+DRAIN_PROMPT = (
+    "Give your short startup greeting from AGENTS.md, then drain the ticket queue: "
+    "Builder then QA, one ticket at a time."
+)
+INTERACTIVE_PROMPT = (
+    "Give your short startup greeting from AGENTS.md, then check Messages/inbox.md "
+    "and wait for human instructions."
+)
 
-@mcp.tool()
-def start_agent(team: str, drain: bool = True) -> str:
-    """
-    Start a Claude agent for a team by opening a Terminal window at the team workspace.
-    Saves the agent PID to .pids/<team>-agent.pid.
 
-    Args:
-        team:  team name (e.g. "ux", "app")
-        drain: True (default) — agent starts with a prompt to drain the ticket queue automatically.
-               False — agent starts in interactive mode, waiting for human input.
-
-    Returns: { team, status, mode } | Error
-    """
+def _launch_terminal_agent(team: str, runtime: str, command: list[str], drain: bool) -> str:
+    """Launch a runtime agent in Terminal and track it with a runtime-specific PID file."""
     if e := validate_team(team):
+        return err(e)
+    if e := validate_runtime(runtime):
         return err(e)
 
     workspace = VAULT_ROOT / team
-    pid_file  = PIDS_DIR / f"{team}-agent.pid"
+    pid_file  = _runtime_pid_file(team, runtime)
     PIDS_DIR.mkdir(exist_ok=True)
 
     # Check if already running
@@ -990,59 +1012,121 @@ def start_agent(team: str, drain: bool = True) -> str:
         pid = int(pid_file.read_text().strip())
         try:
             os.kill(pid, 0)
-            return json.dumps({"team": team, "pid": pid, "status": "already_running"})
+            return json.dumps({"team": team, "runtime": runtime, "pid": pid, "status": "already_running"})
         except ProcessLookupError:
             pid_file.unlink()
+        except PermissionError:
+            return json.dumps({"team": team, "runtime": runtime, "pid": pid, "status": "already_running"})
 
-    launch_file = PIDS_DIR / f"{team}-launch.sh"
-    claude_cmd  = f"exec {CLAUDE_BIN} '{DRAIN_PROMPT}'" if drain else f"exec {CLAUDE_BIN}"
+    prompt = DRAIN_PROMPT if drain else INTERACTIVE_PROMPT
+    launch_file = _runtime_launch_file(team, runtime)
+    agent_cmd = shlex.join([*command, prompt])
     launch_file.write_text(
         f"#!/bin/bash\n"
-        f"echo $$ > {pid_file}\n"
-        f"{claude_cmd}\n"
+        f"echo $$ > {shlex.quote(str(pid_file))}\n"
+        f"exec {agent_cmd}\n"
     )
     launch_file.chmod(0o755)
 
+    shell_cmd = f"cd {shlex.quote(str(workspace))} && {shlex.quote(str(launch_file))}"
     script = (
         f'tell application "Terminal" to do script '
-        f'"cd {workspace} && {launch_file}"\n'
+        f'"{_applescript_string(shell_cmd)}"\n'
         f'tell application "Terminal" to activate'
     )
     subprocess.run(["osascript", "-e", script], check=True)
 
     mode = "drain" if drain else "interactive"
-    return json.dumps({"team": team, "status": "starting", "mode": mode, "pid_file": str(pid_file)})
+    return json.dumps({"team": team, "runtime": runtime, "status": "starting", "mode": mode, "pid_file": str(pid_file)})
 
 
+def _start_claude_agent(team: str, drain: bool = True) -> str:
+    """Start a Claude Code agent for a team."""
+    return _launch_terminal_agent(team, "claude", [str(CLAUDE_BIN)], drain)
 
 
-@mcp.tool()
-def stop_agent(team: str) -> str:
-    """
-    Stop a running team agent by terminating its process.
+def _start_codex_agent(team: str, drain: bool = True) -> str:
+    """Start a Codex agent for a team in autonomous YOLO mode."""
+    return _launch_terminal_agent(team, "codex", [CODEX_BIN, "--dangerously-bypass-approvals-and-sandbox"], drain)
 
-    Args:
-        team: team name (e.g. "ux", "app")
 
-    Returns: { team, pid, status } | Error
-    """
+def _stop_runtime_agent(team: str, runtime: str) -> str:
+    """Stop one team/runtime agent process."""
     if e := validate_team(team):
         return err(e)
+    if e := validate_runtime(runtime):
+        return err(e)
 
-    pid_file = PIDS_DIR / f"{team}-agent.pid"
+    pid_file = _runtime_pid_file(team, runtime)
 
     if not pid_file.exists():
-        return err(f"no running agent found for team '{team}'")
+        return err(f"no running {runtime} agent found for team '{team}'")
 
     pid = int(pid_file.read_text().strip())
 
     try:
         os.kill(pid, 15)  # SIGTERM — graceful shutdown
         pid_file.unlink()
-        return json.dumps({"team": team, "pid": pid, "status": "stopped"})
+        return json.dumps({"team": team, "runtime": runtime, "pid": pid, "status": "stopped"})
     except ProcessLookupError:
         pid_file.unlink()
-        return json.dumps({"team": team, "pid": pid, "status": "was_not_running"})
+        return json.dumps({"team": team, "runtime": runtime, "pid": pid, "status": "was_not_running"})
+    except PermissionError:
+        return err(f"permission denied stopping {runtime} agent for team '{team}'")
+
+
+@mcp.tool()
+def get_agent_status(team: str, runtime: str) -> str:
+    """
+    Get the current status of a team agent for a selected runtime.
+
+    Uses CPU usage as the signal:
+      - ~0% CPU → idle (waiting at the prompt)
+      - >5% CPU  → busy (actively processing a ticket)
+
+    Args:
+        team: team name (e.g. "ux", "app")
+        runtime: agent runtime — "codex" or "claude"
+
+    Returns: { team, runtime, pid, cpu, agent_status } | Error
+      agent_status: "idle" | "busy" | "dead" | "not_running" | "running_unknown"
+    """
+    return _get_runtime_agent_status(team, runtime)
+
+
+@mcp.tool()
+def start_agent(team: str, runtime: str, drain: bool = True) -> str:
+    """
+    Start a team agent for a selected runtime by opening a Terminal window.
+    Saves the agent PID to .pids/<team>-<runtime>-agent.pid.
+
+    Args:
+        team: team name (e.g. "ux", "app")
+        runtime: agent runtime — "codex" or "claude"
+        drain: True (default) — agent starts with a prompt to drain the ticket queue automatically.
+               False — agent starts in interactive mode, waiting for human input.
+
+    Returns: { team, runtime, status, mode } | Error
+    """
+    if runtime == "claude":
+        return _start_claude_agent(team, drain)
+    if runtime == "codex":
+        return _start_codex_agent(team, drain)
+    return err("runtime required: codex or claude")
+
+
+@mcp.tool()
+def stop_agent(team: str, runtime: str) -> str:
+    """
+    Stop a running team agent by terminating its process.
+
+    Args:
+        team: team name (e.g. "ux", "app")
+        runtime: agent runtime — "codex" or "claude"
+
+    Returns: { team, runtime, pid, status } | Error
+    """
+    return _stop_runtime_agent(team, runtime)
 
 
 @mcp.tool()
@@ -1050,21 +1134,27 @@ def list_agents() -> str:
     """
     List all known team agents and their running status.
 
-    Returns: [{ team, pid, status }]
+    Returns: [{ team, runtime, pid, status }]
     """
     PIDS_DIR.mkdir(exist_ok=True)
     results = []
 
     for pid_file in sorted(PIDS_DIR.glob("*-agent.pid")):
-        team = pid_file.stem.replace("-agent", "")
+        m = re.match(r"^(.+)-(claude|codex)-agent$", pid_file.stem)
+        if m:
+            team, runtime = m.group(1), m.group(2)
+        else:
+            team, runtime = pid_file.stem.replace("-agent", ""), "legacy"
         pid  = int(pid_file.read_text().strip())
         try:
             os.kill(pid, 0)
             status = "running"
         except ProcessLookupError:
             status = "dead"
+        except PermissionError:
+            status = "running_unknown"
 
-        results.append({"team": team, "pid": pid, "status": status})
+        results.append({"team": team, "runtime": runtime, "pid": pid, "status": status})
 
     return json.dumps(results, indent=2)
 

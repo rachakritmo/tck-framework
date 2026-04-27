@@ -1,377 +1,200 @@
 # Agent Management — Technical Reference
 
-How `start_agent`, `send_message`, `get_agent_status`, `stop_agent`, and `list_agents` work under the hood.
-
-All five tools live in `mcp/server.py`. They manage Claude Code processes running in Terminal windows on macOS.
-
----
-
-## Architecture Overview
-
-```
-PM Agent (Claude Desktop)
-    │
-    │  MCP call
-    ▼
-mcp/server.py  (FastMCP, runs as subprocess of Claude Desktop)
-    │
-    ├── osascript → Terminal.app → launch.sh → exec claude
-    │                                               │
-    │                                        .pids/ux-agent.pid
-    │
-    └── .pids/ux-agent.pid  ←  read by stop/status/list tools
-```
-
-Team agents are **separate OS processes** running in Terminal windows. The MCP server communicates with them through:
-- **PID files** — track which process is the agent
-- **OS signals** — check liveness (`signal 0`), stop (`SIGTERM`)
-- **`ps` CPU sampling** — detect idle vs busy
-- **`Messages/inbox.md`** — deliver messages from PM to agent
+How `mcp/server.py` starts, tracks, monitors, and stops team agents.
 
 ---
 
 ## Constants
 
-```python
-VAULT_ROOT = Path(__file__).parent.parent   # project root (chain/)
-PIDS_DIR   = VAULT_ROOT / ".pids"           # PID and launch script files
-CLAUDE_BIN = Path.home() / ".local" / "bin" / "claude"
-```
+| Constant | Value | Purpose |
+|---|---|---|
+| `CLAUDE_BIN` | `~/.local/bin/claude` | Path to Claude Code binary |
+| `CODEX_BIN` | `codex` (resolved from PATH) | Codex binary name |
+| `VALID_RUNTIMES` | `["claude", "codex"]` | Accepted runtime values |
+| `PIDS_DIR` | `<vault>/.pids/` | Folder for all PID and launch files |
+| `DRAIN_PROMPT` | `"Give your short startup greeting from AGENTS.md, then drain the ticket queue: Builder then QA, one ticket at a time."` | Sent to agent on `drain=True` |
+| `INTERACTIVE_PROMPT` | `"Give your short startup greeting from AGENTS.md, then check Messages/inbox.md and wait for human instructions."` | Sent to agent on `drain=False` |
 
 ---
 
-## Helper: `_agent_cpu(pid) → float`
+## Files Written Per Agent
 
-```python
-def _agent_cpu(pid: int) -> float:
-    def sample(pid):
-        r = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "%cpu="],
-            capture_output=True, text=True
-        )
-        return float(r.stdout.strip() or "0")
-    cpu1 = sample(pid)
-    time.sleep(0.5)
-    cpu2 = sample(pid)
-    return max(cpu1, cpu2)
-```
+Every team/runtime pair gets two files in `.pids/`:
 
-**What it does:** calls `ps` twice with a 0.5s gap and returns the higher reading.
+| File | Example | Purpose |
+|---|---|---|
+| `<team>-<runtime>-agent.pid` | `ux-claude-agent.pid` | Holds the agent process PID |
+| `<team>-<runtime>-launch.sh` | `ux-claude-launch.sh` | Shell script that captures PID and execs the agent |
 
-**Why `ps -o %cpu=`:** the `=` after the column name suppresses the header line, so stdout is just the number. The `or "0"` guard handles the edge case where the process disappears between `os.kill(0)` check and `ps` call.
-
-**Why two samples:** Claude Code's CPU usage is spiky — it bursts during LLM calls and tool execution, then drops briefly between steps. A single sample might catch a momentary idle dip mid-processing and wrongly classify a busy agent as idle. Taking `max()` of two samples 0.5s apart avoids false negatives.
-
-**Why 5% threshold:** an agent sitting at the `>` prompt uses ~0% CPU (just an idle process waiting for stdin). Any active processing — LLM call, file read, MCP tool call — pushes well above 5%. The threshold has comfortable headroom in both directions.
-
-**Used by:** `get_agent_status` (exposed as MCP tool) and `send_message` (internal wake decision).
-
----
-
-## `start_agent(team)`
-
-**Purpose:** open a Terminal window at the team workspace and launch Claude Code as the team agent.
-
-```python
-def start_agent(team: str) -> str:
-    workspace = VAULT_ROOT / team
-    pid_file  = PIDS_DIR / f"{team}-agent.pid"
-    PIDS_DIR.mkdir(exist_ok=True)
-
-    # 1. Guard — don't start a second instance
-    if pid_file.exists():
-        pid = int(pid_file.read_text().strip())
-        try:
-            os.kill(pid, 0)
-            return json.dumps({"team": team, "pid": pid, "status": "already_running"})
-        except ProcessLookupError:
-            pid_file.unlink()  # stale PID — clean up
-
-    # 2. Write launch script
-    launch_file = PIDS_DIR / f"{team}-launch.sh"
-    launch_file.write_text(
-        f"#!/bin/bash\n"
-        f"echo $$ > {pid_file}\n"
-        f"exec {CLAUDE_BIN} 'Check Messages/inbox.md and start working on tickets.'\n"
-    )
-    launch_file.chmod(0o755)
-
-    # 3. Open Terminal and run the launch script
-    script = (
-        f'tell application "Terminal" to do script '
-        f'"cd {workspace} && {launch_file}"\n'
-        f'tell application "Terminal" to activate'
-    )
-    subprocess.run(["osascript", "-e", script], check=True)
-
-    return json.dumps({"team": team, "status": "starting", "pid_file": str(pid_file)})
-```
-
-### Step 1 — Duplicate guard
-
-`os.kill(pid, 0)` sends signal 0 to the process. Signal 0 does not kill — it's purely a liveness check. If the process is alive, the call returns normally. If the process is dead, it raises `ProcessLookupError`.
-
-- Alive → return `already_running`, do nothing
-- Dead → `pid_file.unlink()` cleans up the stale file, then continue to launch
-
-### Step 2 — Launch script
-
-The launch script solves two problems at once:
-
-**Problem A — Quoting.** The AppleScript `do script` command takes a double-quoted string. Embedding shell single quotes inside it (`sh -c 'echo $$ > file'`) creates quoting conflicts that cause parse errors. Writing the shell logic to a `.sh` file means the AppleScript string becomes `"cd /path && /path/launch.sh"` — no special characters at all.
-
-**Problem B — TTY suspension.** Claude Code is an interactive terminal app that requires a TTY for input/output. Running it with `&` (background) triggers `SIGTTOU` — the OS suspends any background process that tries to write to the terminal. The fix is to run claude in the **foreground**.
-
-But foreground means the shell that started it is blocked — you can't capture the PID with `$!` (which only works for background processes). The solution is `exec`:
+### Launch script contents
 
 ```bash
-echo $$ > pidfile   # write current shell's PID to file
-exec claude '...'   # replace this shell with claude in-place
+#!/bin/bash
+echo $$ > /path/to/ux-claude-agent.pid
+exec /home/user/.local/bin/claude "Give your short startup greeting..."
 ```
 
-`exec` replaces the current process image with `claude` — same PID, same TTY, same file descriptors. The PID written by `echo $$` remains the correct PID for the claude process because `exec` never creates a new process.
-
-**The initial prompt** is passed as a claude argument: `exec claude 'Check Messages/inbox.md...'`. Claude Code accepts an opening message as a positional argument — it starts in interactive mode with that as the first user turn, so the agent immediately reads its inbox and starts working without waiting for human input.
-
-### Step 3 — osascript
-
-`osascript -e` executes an AppleScript expression. `Terminal.app`'s `do script` command opens a new terminal tab and runs the given shell command inside it. `activate` brings Terminal to the foreground.
-
-The two statements are passed as a single `-e` string with a newline between them — AppleScript treats newlines as statement separators.
+- `echo $$` — writes the shell's own PID before replacing it
+- `exec` — replaces the shell process in-place (same PID, same TTY)
+- The agent inherits the PID captured by `echo $$`
 
 ---
 
-## `get_agent_status(team)`
+## MCP Tools
 
-**Purpose:** return real-time status of an agent — `idle`, `busy`, `dead`, or `not_running`.
+### `start_agent(team, runtime, drain=True)`
 
-```python
-def get_agent_status(team: str) -> str:
-    pid_file = PIDS_DIR / f"{team}-agent.pid"
+Starts an agent for a team/runtime pair in a new Terminal window.
 
-    if not pid_file.exists():
-        return json.dumps({"team": team, "agent_status": "not_running"})
+**Flow:**
+1. Validate `team` and `runtime`
+2. Check for existing PID file → if alive, return `already_running`
+3. If PID file exists but process is dead → delete stale PID file
+4. Write launch script to `.pids/<team>-<runtime>-launch.sh`
+5. Run AppleScript: `tell Terminal to do script "cd <workspace> && <launch.sh>"`
+6. Return `{ team, runtime, status: "starting", mode, pid_file }`
 
-    pid = int(pid_file.read_text().strip())
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return json.dumps({"team": team, "pid": pid, "agent_status": "dead"})
+**Runtime dispatch:**
 
-    cpu = _agent_cpu(pid)
-    agent_status = "busy" if cpu > 5.0 else "idle"
+| `runtime` | Binary | Extra flags |
+|---|---|---|
+| `"claude"` | `~/.local/bin/claude` | none |
+| `"codex"` | `codex` | `--dangerously-bypass-approvals-and-sandbox` |
 
-    return json.dumps({"team": team, "pid": pid, "cpu": round(cpu, 1), "agent_status": agent_status})
-```
+**`drain` parameter:**
 
-**Decision tree:**
-
-```
-pid file exists?
-    No  → not_running
-    Yes → os.kill(pid, 0)
-              raises ProcessLookupError → dead
-              returns normally          → alive
-                  cpu > 5%  → busy
-                  cpu ≤ 5%  → idle
-```
-
-**`dead` vs `not_running`:** `dead` means the PID file exists but the process is gone — a crash or unclean shutdown. `not_running` means there is no PID file — the agent was never started or was stopped cleanly by `stop_agent`.
+| Value | Prompt sent to agent |
+|---|---|
+| `True` *(default)* | `DRAIN_PROMPT` — agent greets then drains queue autonomously |
+| `False` | `INTERACTIVE_PROMPT` — agent greets, checks inbox, waits for human |
 
 **Returns:**
 ```json
-{ "team": "ux", "pid": 9801, "cpu": 0.0, "agent_status": "idle" }
-{ "team": "app", "pid": 9900, "cpu": 72.4, "agent_status": "busy" }
-{ "team": "ux", "pid": 9801, "agent_status": "dead" }
-{ "team": "ux", "agent_status": "not_running" }
+{ "team": "ux", "runtime": "claude", "status": "starting", "mode": "drain", "pid_file": "/path/.pids/ux-claude-agent.pid" }
+```
+
+**Already running:**
+```json
+{ "team": "ux", "runtime": "claude", "pid": 12345, "status": "already_running" }
 ```
 
 ---
 
-## `send_message(team, message)`
+### `stop_agent(team, runtime)`
 
-**Purpose:** write a message to the agent's inbox and wake it immediately if idle.
+Sends `SIGTERM` (signal 15) to the agent process and removes the PID file.
 
-```python
-def send_message(team: str, message: str) -> str:
-    inbox = VAULT_ROOT / team / "Messages" / "inbox.md"
-    inbox.parent.mkdir(exist_ok=True)
+**Flow:**
+1. Validate `team` and `runtime`
+2. Read PID from `.pids/<team>-<runtime>-agent.pid`
+3. `os.kill(pid, 15)` — graceful shutdown
+4. Unlink PID file
 
-    ts = now_ts()
-    content = f"## Message from PM — {ts}\n\n{message.strip()}\n"
+**Returns:**
 
-    # Append if unread content already exists
-    if inbox.exists() and inbox.read_text().strip():
-        inbox.write_text(inbox.read_text().rstrip() + "\n\n---\n\n" + content)
-    else:
-        inbox.write_text(content)
-
-    # Wake decision
-    pid_file = PIDS_DIR / f"{team}-agent.pid"
-    wake_status = "not_running"
-
-    if pid_file.exists():
-        pid = int(pid_file.read_text().strip())
-        try:
-            os.kill(pid, 0)
-            cpu = _agent_cpu(pid)
-
-            if cpu > 5.0:
-                wake_status = "agent_busy_message_queued"
-            else:
-                os.kill(pid, 15)       # SIGTERM
-                pid_file.unlink()
-                time.sleep(1)          # wait for process to exit
-                # relaunch via existing launch script
-                subprocess.run(["osascript", "-e", relaunch_script], check=True)
-                wake_status = "agent_restarted"
-
-        except ProcessLookupError:
-            wake_status = "not_running"
-
-    return json.dumps({...,"wake_status": wake_status})
-```
-
-### Inbox write — append safety
-
-`inbox.read_text().strip()` checks whether the file has actual content (not just whitespace). If yes, the new message is appended with a `---` separator. This handles the case where the PM sends multiple messages before the agent reads any of them — nothing is overwritten.
-
-### Wake decision
-
-After writing, `send_message` checks CPU via `_agent_cpu`:
-
-| CPU | Action | `wake_status` |
-|---|---|---|
-| > 5% | Do nothing — agent is mid-ticket, will read inbox after finishing | `agent_busy_message_queued` |
-| ≤ 5% | SIGTERM → wait 1s → relaunch via existing launch script | `agent_restarted` |
-| Process dead | Do nothing — message waits for next `start_agent` | `not_running` |
-
-**Why restart instead of inject input:** there is no safe way to write to an interactive process's stdin from outside without a shared TTY or named pipe set up at process creation time. Restarting is clean — the new session starts with the kickoff prompt, reads the inbox as its first action, and picks up where the old session left off (ticket state is in the MCP server, not in the agent's memory).
-
-**Why `time.sleep(1)` before relaunch:** `SIGTERM` is asynchronous — the process may still be running for a brief period after the signal is sent. Waiting 1 second gives it time to exit cleanly before a new Terminal tab is opened. Without the wait, the new launch script might write a new PID to the file before the old process reads it, causing a race condition.
-
----
-
-## `stop_agent(team)`
-
-**Purpose:** gracefully shut down a running agent and clean up its PID file.
-
-```python
-def stop_agent(team: str) -> str:
-    pid_file = PIDS_DIR / f"{team}-agent.pid"
-
-    if not pid_file.exists():
-        return err(f"no running agent found for team '{team}'")
-
-    pid = int(pid_file.read_text().strip())
-    try:
-        os.kill(pid, 15)   # SIGTERM
-        pid_file.unlink()
-        return json.dumps({"team": team, "pid": pid, "status": "stopped"})
-    except ProcessLookupError:
-        pid_file.unlink()
-        return json.dumps({"team": team, "pid": pid, "status": "was_not_running"})
-```
-
-**`SIGTERM` (signal 15) vs `SIGKILL` (signal 9):**
-
-| Signal | Behaviour |
+| Case | Response |
 |---|---|
-| `SIGTERM` (15) | Sent to the process — it can catch it, finish current work, flush buffers, then exit. Claude Code handles it gracefully. |
-| `SIGKILL` (9) | Immediate forced termination by the OS — process has no chance to clean up. Not used here. |
-
-**Both branches unlink the PID file:** whether the process was alive (stopped now) or already dead (stale PID file), the file is removed. This leaves `.pids/` in a clean state.
+| Stopped successfully | `{ team, runtime, pid, status: "stopped" }` |
+| Process already gone | `{ team, runtime, pid, status: "was_not_running" }` (PID file still cleaned up) |
+| Permission denied | `{ error: "permission denied..." }` |
+| No PID file | `{ error: "no running agent found..." }` |
 
 ---
 
-## `list_agents()`
+### `get_agent_status(team, runtime)`
 
-**Purpose:** survey all known agents across all teams.
+Reports real-time agent status using CPU as the activity signal.
+
+**Flow:**
+1. Validate `team` and `runtime`
+2. Check PID file exists → if not, return `not_running`
+3. `os.kill(pid, 0)` — liveness check (no signal sent)
+4. Sample CPU twice via `ps -p <pid> -o %cpu=`, 0.5s apart, take `max()`
+5. `cpu > 5.0%` → `busy`, else → `idle`
+
+**Returns:**
+```json
+{ "team": "ux", "runtime": "claude", "pid": 9801, "cpu": 72.4, "agent_status": "busy" }
+```
+
+**`agent_status` values:**
+
+| Value | Meaning |
+|---|---|
+| `idle` | Process alive, CPU ≈ 0% — finished work, waiting at prompt |
+| `busy` | Process alive, CPU > 5% — actively processing a ticket |
+| `dead` | PID file exists but process is gone — crashed or killed |
+| `not_running` | No PID file — never started or cleanly stopped |
+| `running_unknown` | Process exists but CPU cannot be sampled (permission) |
+
+---
+
+### `list_agents()`
+
+Reads all files in `.pids/` matching `*-agent.pid` and checks liveness.
+
+**PID file naming:** `<team>-<runtime>-agent.pid`
+- Parsed with regex `^(.+)-(claude|codex)-agent$`
+- Legacy PID files (no runtime in name) are tagged `runtime: "legacy"`
+
+**Returns:**
+```json
+[
+  { "team": "app", "runtime": "codex",  "pid": 12346, "status": "running" },
+  { "team": "ux",  "runtime": "claude", "pid": 12345, "status": "dead"    }
+]
+```
+
+| `status` | Meaning |
+|---|---|
+| `running` | `os.kill(pid, 0)` succeeded |
+| `dead` | `ProcessLookupError` — process is gone |
+| `running_unknown` | `PermissionError` — exists but cannot signal |
+
+---
+
+## Internal Helpers
+
+| Function | Purpose |
+|---|---|
+| `_runtime_pid_file(team, runtime)` | Returns `Path(.pids/<team>-<runtime>-agent.pid)` |
+| `_runtime_launch_file(team, runtime)` | Returns `Path(.pids/<team>-<runtime>-launch.sh)` |
+| `_agent_cpu(pid)` | Samples CPU twice via `ps`, 0.5s apart, returns `max()` |
+| `_applescript_string(value)` | Escapes `\` and `"` for safe embedding in AppleScript string |
+| `_get_runtime_agent_status(team, runtime)` | Core logic for `get_agent_status` |
+| `_launch_terminal_agent(team, runtime, command, drain)` | Core logic for all `start_agent` calls |
+| `_start_claude_agent(team, drain)` | Calls `_launch_terminal_agent` with Claude binary |
+| `_start_codex_agent(team, drain)` | Calls `_launch_terminal_agent` with Codex + YOLO flag |
+| `_stop_runtime_agent(team, runtime)` | Core logic for `stop_agent` |
+| `validate_runtime(runtime)` | Returns error string if runtime not in `VALID_RUNTIMES` |
+
+---
+
+## Platform Notes
+
+- **macOS only** — `start_agent` uses `osascript` to open Terminal windows
+- `stop_agent` uses `os.kill(pid, 15)` — POSIX, works on macOS and Linux
+- `get_agent_status` uses `ps -p <pid> -o %cpu=` — macOS/Linux; Windows syntax differs
+- Windows support is planned — will require replacing `osascript`, `ps`, and signal handling
+
+---
+
+## Typical Flow
 
 ```python
-def list_agents() -> str:
-    PIDS_DIR.mkdir(exist_ok=True)
-    results = []
+# 1. Start agent — drains queue automatically
+start_agent("ux", "claude")
+# → { status: "starting", mode: "drain" }
 
-    for pid_file in sorted(PIDS_DIR.glob("*-agent.pid")):
-        team = pid_file.stem.replace("-agent", "")
-        pid  = int(pid_file.read_text().strip())
-        try:
-            os.kill(pid, 0)
-            status = "running"
-        except ProcessLookupError:
-            status = "dead"
+# 2. Monitor progress
+get_agent_status("ux", "claude")
+# → { agent_status: "busy", cpu: 68.2 }
 
-        results.append({"team": team, "pid": pid, "status": status})
-
-    return json.dumps(results, indent=2)
-```
-
-**Team name extraction:** PID files are named `<team>-agent.pid`. `pid_file.stem` gives `ux-agent`, then `.replace("-agent", "")` gives `ux`. This means team names are implicit in the filename — no separate registry needed.
-
-**`running` vs `dead`:** `list_agents` does not use `_agent_cpu` — it only checks process liveness, not activity. Use `get_agent_status` if you need `idle` vs `busy` for a specific team.
-
-**`PIDS_DIR.mkdir(exist_ok=True)`:** called at the top so `glob` doesn't fail if the directory was never created (no agent has ever been started).
-
----
-
-## Data Flow Summary
-
-```
-start_agent("ux")
-    │
-    ├── writes  .pids/ux-launch.sh      (bash script: echo $$, exec claude)
-    ├── writes  .pids/ux-agent.pid      (written BY launch.sh at runtime)
-    └── runs    osascript → Terminal → launch.sh → exec claude '...'
-
-
-send_message("ux", "...")
-    │
-    ├── writes  ux/Messages/inbox.md    (PM message, timestamped)
-    └── reads   .pids/ux-agent.pid
-                    │
-                    ├── os.kill(pid, 0)     alive?
-                    ├── _agent_cpu(pid)     idle?
-                    │       idle → SIGTERM + relaunch
-                    │       busy → leave running, message queued
-                    └── ProcessLookupError → not_running
-
-
-stop_agent("ux")
-    │
-    ├── reads   .pids/ux-agent.pid
-    ├── sends   SIGTERM to pid
-    └── unlinks .pids/ux-agent.pid
-
-
-get_agent_status("ux")
-    │
-    ├── reads   .pids/ux-agent.pid
-    ├── os.kill(pid, 0)     alive check
-    └── _agent_cpu(pid)     idle / busy
-
-
+# 3. Check all teams at once
 list_agents()
-    │
-    └── glob .pids/*-agent.pid
-            └── os.kill(pid, 0) per file → running / dead
+# → [{ team: "ux", runtime: "claude", status: "running" }, ...]
+
+# 4. Shut down when done
+stop_agent("ux", "claude")
+# → { status: "stopped" }
 ```
-
----
-
-## Files Written by the System
-
-```
-chain/
-└── .pids/
-    ├── ux-agent.pid       ← PID of the running ux claude process
-    ├── ux-launch.sh       ← bootstrap script for ux agent
-    ├── app-agent.pid
-    └── app-launch.sh
-
-chain/ux/
-└── Messages/
-    └── inbox.md           ← PM writes here; agent reads and clears
-```
-
-`.pids/` is gitignored — it contains runtime state only.

@@ -47,7 +47,7 @@ Shall I scaffold `app` and `deploy` now, or do you want to handle that first?
 ```
 
 - ✅ = team already exists (`list_teams()` returned it)
-- ➕ = team needs to be created (`mkdir` + write `CLAUDE.md`)
+- ➕ = team needs to be created (`mkdir` + write `AGENTS.md`, plus the runtime files the human selects)
 
 Wait for the human to confirm before scaffolding any new team or writing any ticket.
 

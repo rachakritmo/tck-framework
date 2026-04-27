@@ -162,25 +162,29 @@ If this fails, the MCP server is not connected — check Step 4 and Step 5.
 
 ## Step 9 — Start team agents
 
-Each team agent is a **separate Claude Code window** opened at the team's folder.
+Each team agent is a **separate Codex or Claude runtime window** opened at the team's folder.
 
 ```bash
-# In a new terminal tab or window:
+# Codex
 cd ~/chain/ux
-claude
+codex --dangerously-bypass-approvals-and-sandbox
+
+# Claude
+cd ~/chain/ux
+~/.local/bin/claude
 ```
 
-Because `ux/CLAUDE.md` exists, this window becomes the UX agent automatically — it reads `TICKET_AGENTS_RULES.md` (via `@` import) and the UX-specific standards and boundaries.
+Because `ux/AGENTS.md` exists, the Codex window becomes the UX agent automatically. Claude reads `ux/CLAUDE.md`, which points to `ux/AGENTS.md`. The team instructions import `TICKET_AGENTS_RULES.md` and define the UX-specific standards and boundaries.
 
 Open one window per team:
 
 | Team | Folder | Command |
 |---|---|---|
-| UX | `chain/ux/` | `cd ~/chain/ux && claude` |
-| App | `chain/app/` | `cd ~/chain/app && claude` |
-| Deploy | `chain/deploy/` | `cd ~/chain/deploy && claude` |
+| UX | `chain/ux/` | `cd ~/chain/ux && codex --dangerously-bypass-approvals-and-sandbox` |
+| App | `chain/app/` | `cd ~/chain/app && codex --dangerously-bypass-approvals-and-sandbox` |
+| Deploy | `chain/deploy/` | `cd ~/chain/deploy && codex --dangerously-bypass-approvals-and-sandbox` |
 
-> **The PM agent cannot start team agents.** Each agent window must be opened by you. Once open, agents pick up tickets autonomously.
+You can also ask the PM to start an agent through MCP, for example `start_agent("ux", "codex")` or `start_agent("ux", "claude")`.
 
 ---
 
@@ -191,9 +195,9 @@ Run all of these simultaneously:
 | Window | Tool | Folder | Purpose |
 |---|---|---|---|
 | 1 | **Obsidian** | `chain/` | View tickets, attach images, read specs |
-| 2 | **Claude Code** | `chain/` | PM agent — create and manage tickets |
-| 3 | **Claude Code** | `chain/ux/` | UX agent |
-| 4 | **Claude Code** | `chain/app/` | App agent |
+| 2 | **Codex or Claude** | `chain/` | PM agent — create and manage tickets |
+| 3 | **Codex or Claude** | `chain/ux/` | UX agent |
+| 4 | **Codex or Claude** | `chain/app/` | App agent |
 
 ---
 
@@ -247,12 +251,13 @@ Scaffold a new team called "web" for frontend development.
 ```
 
 The PM agent will:
-1. Create `web/Tickets/`, `web/Artifacts/`, `web/TicketAttachments/`, `web/Messages/`, `web/.claude/`
-2. Write `web/CLAUDE.md` — tailored to frontend work
-3. Write `web/.claude/settings.local.json` — pre-authorised permissions so the agent runs without permission prompts
-4. Give you the command to start the web agent
+1. Ask whether the team should support Codex, Claude, or both
+2. Create `web/Tickets/`, `web/Artifacts/`, `web/TicketAttachments/`, and `web/Messages/`
+3. Write `web/AGENTS.md` — tailored to frontend work
+4. Add `.codex/config.toml` and/or `.claude/settings.local.json` based on the selected runtime support
+5. Give you the runtime-specific command to start the web agent
 
-Then open a new Claude Code window at `chain/web/` to start the agent.
+Then open a new Codex or Claude window at `chain/web/` to start the agent, or ask the PM to call `start_agent("web", "codex")` or `start_agent("web", "claude")`.
 
 ---
 
@@ -272,17 +277,18 @@ Then open a new Claude Code window at `chain/web/` to start the agent.
   ```
 
 **PM agent doesn't know its role**
-- Claude Code must be opened at the **project root** (`chain/`) — not a subfolder
-- Confirm `chain/CLAUDE.md` exists and starts with `# TCK — PM Agent`
-- Run `/reset` in Claude Code to reload context
+- Codex or Claude must be opened at the **project root** (`chain/`) — not a subfolder
+- Confirm `chain/AGENTS.md` exists and starts with `# TCK — PM Agent`
+- For Claude, confirm `chain/CLAUDE.md` points to `AGENTS.md`
+- Reset the runtime session to reload context
 
 **`unknown team` error from MCP tools**
 - `mcp/server.py` must be inside the vault root (`chain/mcp/server.py`)
 - Do not move `server.py` to a different location
 
 **Team agent picks up wrong tickets**
-- Confirm Claude Code is opened at the correct team folder (e.g., `chain/ux/`)
-- Each agent folder has its own `CLAUDE.md` which sets `team="ux"` in all MCP calls
+- Confirm the runtime is opened at the correct team folder (e.g., `chain/ux/`)
+- Each agent folder has its own `AGENTS.md` which sets `team="ux"` in all MCP calls
 
 **Windows: path errors in the config**
 - Use double backslashes `\\` in JSON, or forward slashes `/` — both work
@@ -294,7 +300,8 @@ Then open a new Claude Code window at `chain/web/` to start the agent.
 
 ```
 chain/
-├── CLAUDE.md                   ← PM agent identity — open Claude Code here
+├── AGENTS.md                   ← PM agent identity — open Codex here
+├── CLAUDE.md                   ← Claude compatibility pointer to AGENTS.md
 ├── TICKET_AGENTS_RULES.md      ← shared rules imported by all team agents
 ├── PM_DOCUMENTS_GUIDE.md       ← how the PM reads and uses Documents/
 ├── PM_SCAFFOLDING_GUIDE.md     ← how the PM scaffolds new team workspaces
@@ -306,7 +313,10 @@ chain/
 │   └── requirements.txt        ← Python dependencies (just `mcp`)
 ├── Documents/                  ← customer briefs, specs, reference material
 ├── ux/
-│   ├── CLAUDE.md               ← UX agent identity — open Claude Code here
+│   ├── AGENTS.md               ← UX agent identity — open Codex here
+│   ├── CLAUDE.md               ← Claude compatibility pointer to AGENTS.md
+│   ├── .codex/
+│   │   └── config.toml         ← Codex autonomy profile
 │   ├── .claude/
 │   │   └── settings.local.json ← pre-authorised permissions (no prompts)
 │   ├── Tickets/
